@@ -23,6 +23,8 @@
 #include "stdio.h"
 #include "arm_math.h"
 #include "arm_const_structs.h"
+#include "stdbool.h"
+#include "stdlib.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -87,25 +89,34 @@ static void MX_TIM3_Init(void);
 #define SAMPLE_SIZE 2048 // Tamanho da amostra do sinal (potência de 2)
 #define FFT_SIZE (SAMPLE_SIZE / 2) // Tamanho da FFT. N_BINS
 #define HANNING_COEFF		0.5f
+#define FFTRMSSCALE 	1.4142f    //2.0(FFT) * 0.707(RMS)
 #define HANN_KF_ACC			(2 * PI / (FFT_SIZE - 1))
-#define FS 40000.0f						// Frequẽncia de amostragem
-#define FC 15000.0f						// Frequeência de corte
+#define FS 55000.0f						// Frequẽncia de amostragem
+#define FC 2000.0f						// Frequeência de corte
 
+//#define DSB 1				//Banda simples SSB ou dupla DSP no espectro de frequências
 
-
+#ifdef DSB
+	#define FFT_BINS (FFT_SIZE)
+#else
+	#define FFT_BINS (FFT_SIZE/2)
+#endif
 // Private variables -----------------------------------------------------------
-float32_t input_signal[SAMPLE_SIZE];	//sinal de entrada lido pelo AD
-float32_t output_signal[FFT_SIZE];		//Sinal de saída da FFT
-float32_t fft_power[FFT_SIZE];			// Valor absoluto da FFT
+float32_t input_signal_AC[SAMPLE_SIZE];	//sinal de entrada lido pelo AD normalizado de -1,5 até +1,5
+float32_t fft_mag_BINS[FFT_BINS];		//amplitude dos BINS da FFT
+float32_t fft_raw_BINS[SAMPLE_SIZE];	//Valores complexos dos BINS da FFT
 uint32_t ifftFlag = 0; 					// 0 Real FFT RFFT; 1 Real Inversa RIFFT
 uint32_t doBitReverse = 1;
-arm_rfft_fast_instance_f32 fft;
 
+arm_rfft_fast_instance_f32 fft;
+arm_rfft_instance_f32 si;
 arm_cfft_radix4_instance_f32 S;	/* ARM CFFT module */
+float freqMax = 0;
+float ampMax = 0;
 
 /* Reference index at which max energy of bin ocuurs */
 uint32_t testIndex = 0;					// Index de posição do BIN de máxima energia
-float32_t maxValue;						// Valor do BIN de máxima energia
+float32_t maxValue = 0;						// Valor do BIN de máxima energia
 
 
 volatile uint32_t g_ADCValue, g_DACValue;	// Váriaveis de armazenamento dos valores do ADC DAC
@@ -130,7 +141,7 @@ float32_t x,y = {0};
 // Private function prototypes -------------------------------------------------
 float HanningWindow(uint32_t u32Sample);
 void FFTCalc(void);
-
+void ComputeFft(float *pfInputSignal, float *pfFftOutput, bool bApplyWindow);
 
 /* USER CODE END 0 */
 
@@ -187,8 +198,6 @@ int main(void)
 	xh2 = 0;
 	yh1 = 0;
 	yh2 = 0;
-
-	//	arm_rfft_fast_init_f32(&fft, SAMPLE_SIZE);
 
 	HAL_UART_Receive_IT(&huart2, (uint8_t*)buffer, 1);  //Inicia o recebimento da UART
 	HAL_TIM_Base_Start_IT(&htim3);						//Inicia o timer
@@ -518,7 +527,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 
 	// Adicionar a amostra ao vetor de entrada
 	static uint16_t index = 0;
-	input_signal[index] = sample;
+	input_signal_AC[index] = sample;
 	index++;
 	//Se o vetor de entrada estiver completo, zera o index
 	if (index >= SAMPLE_SIZE)
@@ -535,6 +544,75 @@ float HanningWindow(uint32_t u32Sample)
 	return (HANNING_COEFF * (1.0f - arm_cos_f32(HANN_KF_ACC * u32Sample)));
 }
 // *****************************************************************************
+/// @brief		Calcula a FFT do sinal de entrada
+/// @fn			void ComputeFft(float *pfInputSignal, float *pfFftOutput, bool bApplyWindow)
+/// @param[in]	pfInputSignal		@brief Sinal de entrada
+/// @param[out]	pfFftOutput			@brief FFT
+// *****************************************************************************
+void ComputeFft(float *pfInputSignal, float *pfFftOutput, bool bApplyWindow)
+{
+	int n;
+	float fScale;
+	float *pout;
+
+	pout = pfFftOutput;
+	n = 0;
+
+	if(bApplyWindow)
+	{
+		fScale = FFTRMSSCALE / (HANNING_COEFF) / FFT_SIZE;	//fator de ajuste para normalizar ao valor RMS do sinal de entrada.
+		while (n < FFT_SIZE)
+		{
+			*pout++ = pfInputSignal[n] * HanningWindow(n) ;	// aplica a janela
+			n++;
+			*pout++ = 0.0f;
+			*pout++ = pfInputSignal[n] * HanningWindow(n) ;	// aplica a janela
+			n++;
+			*pout++ = 0.0f;
+		}
+	}else
+	{
+		fScale = FFTRMSSCALE / FFT_SIZE;	//fator de ajuste para normalizar ao valor RMS do sinal de entrada.
+		while (n < FFT_SIZE)
+		{
+			*pout++ = pfInputSignal[n++] ;
+			*pout++ = 0.0f;
+			*pout++ = pfInputSignal[n++] ;
+			*pout++ = 0.0f;
+		}
+	}
+	fScale = 1.00f / FFT_SIZE;	//fator de ajuste para normalizar ao valor de pico do sinal de entrada.
+
+	arm_cfft_f32(&arm_cfft_sR_f32_len1024, pfFftOutput, 0, 1);
+//	arm_cmplx_mag_f32(pfFftOutput, pfFftOutput, FFT_BINS);	// calcula o módulo da amplitude
+//	arm_scale_f32(pfFftOutput, fScale, pfFftOutput, FFT_BINS); //normaliza os valores conforme o fator
+}
+
+// *****************************************************************************
+//	for (int n = 0; n < SAMPLE_SIZE; n += 2)
+//		input_signal[n] *= HanningWindow(n);
+
+//	/* Initialize the CFFT/CIFFT module, intFlag = 0, doBitReverse = 1 */
+//	arm_cfft_radix4_init_f32(&S, FFT_SIZE, 0, 1);
+//
+//	/* Process the data through the CFFT/CIFFT module */
+//	arm_cfft_radix4_f32(&S, input_signal);
+//
+//	/* Process the data through the Complex Magniture Module for calculating the magnitude at each bin */
+//	arm_cmplx_mag_f32(input_signal, fft_raw_BINS, FFT_SIZE);
+//
+//	/* Calculates maxValue and returns corresponding value */
+//	arm_max_f32(fft_raw_BINS, FFT_SIZE, &maxValue, &testIndex);
+
+//	arm_rfft_fast_init_f32(&fft, FFT_SIZE);
+//	arm_rfft_fast_f32(&fft, input_signal, output_signal, ifftFlag);
+//	arm_cmplx_mag_f32(output_signal, fft_power, FFT_SIZE);
+//	/* Calculates maxValue and returns corresponding BIN value */
+//		arm_max_f32(fft_mag_BINS, FFT_SIZE, &maxValue, &testIndex);
+// *****************************************************************************
+
+
+// *****************************************************************************
 /// @brief		Calculo da FFT
 /// @fn			void FFTCalc(void)
 /// @param[in]
@@ -542,31 +620,22 @@ float HanningWindow(uint32_t u32Sample)
 // *****************************************************************************
 void FFTCalc(void)
 {
-//	for (int n = 0; n < SAMPLE_SIZE; n += 2)
-//		input_signal[n] *= HanningWindow(n);
+	ComputeFft(input_signal_AC, fft_raw_BINS,false);
+	arm_cmplx_mag_f32(fft_raw_BINS, fft_mag_BINS, FFT_BINS);	// calcula o módulo da amplitude de número complexo
+//	arm_abs_f32(fft_raw_BINS, fft_mag_BINS, FFT_BINS);			//calcula o módulo da amplitude de número float
+	arm_scale_f32(fft_mag_BINS, (float)1.00f/FFT_SIZE, fft_mag_BINS, FFT_BINS);
 
-	/* Initialize the CFFT/CIFFT module, intFlag = 0, doBitReverse = 1 */
-	arm_cfft_radix4_init_f32(&S, FFT_SIZE, 0, 1);
-
-	/* Process the data through the CFFT/CIFFT module */
-	arm_cfft_radix4_f32(&S, input_signal);
-
-	/* Process the data through the Complex Magniture Module for calculating the magnitude at each bin */
-	arm_cmplx_mag_f32(input_signal, fft_power, FFT_SIZE);
-
-	/* Calculates maxValue and returns corresponding value */
-	arm_max_f32(fft_power, FFT_SIZE, &maxValue, &testIndex);
-
-
-//	arm_rfft_fast_init_f32(&fft, FFT_SIZE);
-//	arm_rfft_fast_f32(&fft, input_signal, output_signal, ifftFlag);
-//	arm_cmplx_mag_f32(output_signal, fft_power, FFT_SIZE);
-//	/* Calculates maxValue and returns corresponding BIN value */
-//		arm_max_f32(output_signal, FFT_SIZE, &maxValue, &testIndex);
+	arm_max_f32(fft_mag_BINS, FFT_SIZE, &maxValue, &testIndex);
+	freqMax = (float)testIndex * FS / FFT_SIZE;
+	#ifdef DSB
+		ampMax = fabs(maxValue);
+	#else
+		ampMax = 2 * fabs(maxValue);
+	#endif
 }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-
+	HAL_TIM_Base_Stop_IT(&htim3);
 	if(huart->Instance == USART2)
 	{
 		int i;
@@ -576,22 +645,22 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 		{
 			for(i = 0; i < SAMPLE_SIZE - 1; i++ )
 			{
-				u8size = sprintf((char*)u8data,"%.4f, ",input_signal[i]);
+				u8size = sprintf((char*)u8data,"%.5f, ",input_signal_AC[i]);
 				HAL_UART_Transmit(&huart2, u8data, u8size,10);
 			}
-			u8size = sprintf((char*)u8data,"%.4f",input_signal[i]);
+			u8size = sprintf((char*)u8data,"%.6f",input_signal_AC[i]);
 			HAL_UART_Transmit(&huart2, u8data, u8size,10);
 			HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2,10);
 		}
 		else if (buffer[0]== 'O')
 		{
 			FFTCalc();
-			for(i = 0; i < FFT_SIZE - 1; i++ )
+			for(i = 0; i < FFT_BINS - 1; i++ )
 			{
-				u8size = sprintf((char*)u8data,"%.4f, ",fft_power[i]);
+				u8size = sprintf((char*)u8data,"%.5f, ",fft_mag_BINS[i]);
 				HAL_UART_Transmit(&huart2, u8data, u8size,10);
 			}
-			u8size = sprintf((char*)u8data,"%.4f",fft_power[i]);
+			u8size = sprintf((char*)u8data,"%.5f",fft_mag_BINS[i]);
 			HAL_UART_Transmit(&huart2, u8data, u8size,10);
 			HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2,10);
 		}
@@ -605,8 +674,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 			u8size = sprintf((char*)u8data,"%ld\r\n",(uint32_t)FS);
 			HAL_UART_Transmit(&huart2, u8data, u8size,10);
 		}
+		else if (buffer[0]== 'M')
+		{
+			if(FFT_SIZE == FFT_BINS)
+				u8size = sprintf((char*)u8data,"1\r\n"); //DSB
+			else
+				u8size = sprintf((char*)u8data,"0\r\n"); //SSB
+			HAL_UART_Transmit(&huart2, u8data, u8size,10);
+		}
 		memset(buffer,0x00,sizeof(buffer));
 		HAL_UART_Receive_IT(&huart2, (uint8_t*)buffer, 1);
+		HAL_TIM_Base_Start_IT(&htim3);
 	}
 }
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
